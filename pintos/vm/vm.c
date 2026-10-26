@@ -3,6 +3,26 @@
 #include "threads/malloc.h"
 #include "vm/vm.h"
 #include "vm/inspect.h"
+#include "threads/vaddr.h"
+
+/* Hash and compare SPT entries by virtual page address. */
+//- page_hash(): 가상 주소를 이용해 해시값을 계산하는 함수
+//page_less(): 두 페이지의 가상 주소를 비교하는 함수
+/* Returns a hash value for page p. */
+uint64_t
+page_hash (const struct hash_elem *p_, void *aux UNUSED) {
+  const struct page *p = hash_entry (p_, struct page, hash_elem);
+  return hash_bytes (&p->va, sizeof p->va);
+}
+/* Returns true if page a precedes page b. */
+bool
+page_less (const struct hash_elem *a_,
+           const struct hash_elem *b_, void *aux UNUSED) {
+  const struct page *a = hash_entry (a_, struct page, hash_elem);
+  const struct page *b = hash_entry (b_, struct page, hash_elem);
+
+  return a->va < b->va;
+}
 
 /* Initializes the virtual memory subsystem by invoking each subsystem's
  * intialize codes. */
@@ -62,21 +82,34 @@ err:
 
 /* Find VA from spt and return page. On error, return NULL. */
 struct page *
-spt_find_page (struct supplemental_page_table *spt UNUSED, void *va UNUSED) {
-	struct page *page = NULL;
-	/* TODO: Fill this function. */
+spt_find_page(struct supplemental_page_table *spt, void *va) {
 
-	return page;
+    /* 1. 검색할 페이지 시작 주소 구하기 */
+    struct page key = {
+        .va = pg_round_down(va),
+    };
+
+    /* 2. SPT의 Hash Table에서 검색 */
+    struct hash_elem *found = hash_find(&spt->pages, &key.hash_elem);
+
+    /* 3. 검색 실패 */
+    if (found == NULL)
+        return NULL;
+
+    /* 4. 찾은 hash_elem에서 struct page 주소 구하기 */
+    return hash_entry(found, struct page, hash_elem);
 }
 
 /* Insert PAGE into spt with validation. */
 bool
 spt_insert_page (struct supplemental_page_table *spt UNUSED,
 		struct page *page UNUSED) {
-	int succ = false;
 	/* TODO: Fill this function. */
 
-	return succ;
+
+	 return hash_insert (&spt->pages, &page->hash_elem) == NULL;
+	//NULL: 새 페이지가 삽입됨 -> true
+	//기존 요소의 주소: 같은 va가 이미 있어서 삽입되지 않음 -> false
 }
 
 void
@@ -174,6 +207,7 @@ vm_do_claim_page (struct page *page) {
 /* Initialize new supplemental page table */
 void
 supplemental_page_table_init (struct supplemental_page_table *spt UNUSED) {
+	hash_init (&spt->pages, page_hash, page_less, NULL);
 }
 
 /* Copy supplemental page table from src to dst */
