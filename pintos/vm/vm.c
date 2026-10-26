@@ -136,10 +136,18 @@ vm_evict_frame (void) {
 static struct frame *
 vm_get_frame (void) {
 	struct frame *frame = NULL;
-	/* TODO: Fill this function. */
 
+	/* TODO: 페이지 할당 실패 시 스왑 아웃 처리 */
+	frame = malloc(sizeof(struct frame));
+	if (frame == NULL) {
+		return NULL;
+	}
 	ASSERT (frame != NULL);
-	ASSERT (frame->page == NULL);
+
+	if ((frame->kva = palloc_get_page(PAL_USER)) == NULL) {
+		PANIC("todo");
+	}
+	frame->page = NULL;
 	return frame;
 }
 
@@ -178,6 +186,9 @@ bool
 vm_claim_page (void *va UNUSED) {
 	struct page *page = NULL;
 	/* TODO: Fill this function */
+	if((page = spt_find_page(&thread_current()->spt, va)) == NULL) {
+		return false;
+	}
 
 	return vm_do_claim_page (page);
 }
@@ -186,13 +197,26 @@ vm_claim_page (void *va UNUSED) {
 static bool
 vm_do_claim_page (struct page *page) {
 	struct frame *frame = vm_get_frame ();
+	if (frame == NULL) {
+		return false;
+	}
 
 	/* Set links */
 	frame->page = page;
 	page->frame = frame;
 
 	/* TODO: Insert page table entry to map page's VA to frame's PA. */
+	/* 현재 스레드의 페이지 테이블을 물리 프레임으로 연결  */
+	struct thread *curr = thread_current();
+	if (!pml4_set_page(curr->pml4, page->va, frame->kva, page->writable)) {
+		palloc_free_page(frame->kva);
+		free(frame);
+		page->frame = NULL;
 
+		return false;
+	}
+
+	/* TODO: swap_in 실패시 처리? */
 	return swap_in (page, frame->kva);
 }
 
