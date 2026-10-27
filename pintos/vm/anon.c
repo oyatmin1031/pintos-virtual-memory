@@ -21,6 +21,7 @@ static const struct page_operations anon_ops = {
 void
 vm_anon_init (void) {
 	/* TODO: Set up the swap_disk. */
+
 	swap_disk = NULL;
 }
 
@@ -28,9 +29,9 @@ vm_anon_init (void) {
 bool
 anon_initializer (struct page *page, enum vm_type type, void *kva) {
 	/* Set up the handler */
+	//이 페이지를 VM_ANON으로 관리하도록 전환
 	page->operations = &anon_ops;
-
-	struct anon_page *anon_page = &page->anon;
+	return true;
 }
 
 /* Swap in the page by read contents from the swap disk. */

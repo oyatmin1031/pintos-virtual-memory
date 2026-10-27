@@ -64,17 +64,49 @@ bool
 vm_alloc_page_with_initializer (enum vm_type type, void *upage, bool writable,
 		vm_initializer *init, void *aux) {
 
-	ASSERT (VM_TYPE(type) != VM_UNINIT)
+	ASSERT (VM_TYPE(type) != VM_UNINIT);
 
 	struct supplemental_page_table *spt = &thread_current ()->spt;
 
 	/* Check wheter the upage is already occupied or not. */
+	//가상 페이지 중복 검사
 	if (spt_find_page (spt, upage) == NULL) {
 		/* TODO: Create the page, fetch the initialier according to the VM type,
 		 * TODO: and then create "uninit" page struct by calling uninit_new. You
 		 * TODO: should modify the field after calling the uninit_new. */
+		//페이지 할당 해주기
+		struct page *page = malloc(sizeof(struct page));
+		//예외 검사
+		if(page == NULL){
+			goto err;
+		}
+		//
+		bool (*initializer) (struct page *, enum vm_type, void *) = NULL;
+
+		switch (VM_TYPE(type)) {
+    	case VM_ANON:
+        	initializer = anon_initializer;
+        	break;
+
+    	case VM_FILE:
+        	initializer = file_backed_initializer;
+        	break;
+
+    	default:
+        free(page);
+        goto err;
+}
+	uninit_new(page, upage, init, type, aux, initializer);
+	page->writable = writable;
+	
+
 
 		/* TODO: Insert the page into the spt. */
+	if(spt_insert_page(spt,page) == false){
+		free(page);
+		goto err;
+		}
+		return true;
 	}
 err:
 	return false;
@@ -145,6 +177,20 @@ static struct frame *
 vm_get_frame (void) {
 	struct frame *frame = NULL;
 	/* TODO: Fill this function. */
+	//프레임 관리할 구조체 할당 해주기
+	frame = malloc(sizeof(struct frame));
+	if(frame == NULL){
+		PANIC("frame allocation fail");
+	}
+	//진짜 프레임 할당 RAM에서 비어 있는 물리 페이지를 찾아서 할당
+	frame->kva = palloc_get_page(PAL_USER);
+	if(frame->kva == NULL){
+		free(frame);
+		PANIC("todo:EVICTION");
+	}
+
+    frame->page = NULL;
+
 
 	ASSERT (frame != NULL);
 	ASSERT (frame->page == NULL);
@@ -183,11 +229,16 @@ vm_dealloc_page (struct page *page) {
 
 /* Claim the page that allocate on VA. */
 bool
-vm_claim_page (void *va UNUSED) {
-	struct page *page = NULL;
-	/* TODO: Fill this function */
+vm_claim_page(void *va) {
+    /* 1. 현재 프로세스의 SPT에서 페이지 검색 */
+    struct page *page = spt_find_page(&thread_current()->spt, va);
 
-	return vm_do_claim_page (page);
+    /* 2. 해당 페이지가 없으면 실패 */
+    if (page == NULL)
+        return false;
+
+    /* 3. 찾은 페이지를 실제 프레임에 올리기 */
+    return vm_do_claim_page(page);
 }
 
 /* Claim the PAGE and set up the mmu. */
@@ -200,12 +251,20 @@ vm_do_claim_page (struct page *page) {
 	page->frame = frame;
 
 	/* TODO: Insert page table entry to map page's VA to frame's PA. */
-
+	bool success = pml4_set_page (thread_current ()->pml4, page->va,frame->kva, page->writable);
+	//false가 나오면 기존에 선언했던 것들 할당 했던것들 다 free나 null -> 메모리 누수 떄문에.
+	if (!success) {
+    page->frame = NULL;
+    frame->page = NULL;
+    palloc_free_page (frame->kva);
+    free (frame);
+    return false;
+}
 	return swap_in (page, frame->kva);
 }
 
 /* Initialize new supplemental page table */
-void
+void 
 supplemental_page_table_init (struct supplemental_page_table *spt UNUSED) {
 	hash_init (&spt->pages, page_hash, page_less, NULL);
 }

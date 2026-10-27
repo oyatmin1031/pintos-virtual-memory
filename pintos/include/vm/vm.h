@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include "threads/palloc.h"
 #include "lib/kernel/hash.h"
+#include "threads/mmu.h"
 
 enum vm_type {
 	/* page not initialized */
@@ -49,6 +50,7 @@ struct page {
 	struct hash_elem hash_elem;  /* SPT 해시 테이블에 연결할 요소 */
 
 	/* Your implementation */
+	bool writable; /* 읽고 쓰기한거?*/
 
 	/* Per-type data are binded into the union.
 	 * Each function automatically detects the current union */
@@ -76,7 +78,7 @@ struct page_operations {
 	bool (*swap_in) (struct page *, void *);
 	bool (*swap_out) (struct page *);
 	void (*destroy) (struct page *);
-	enum vm_type type;
+	enum vm_type type; 
 };
 
 #define swap_in(page, v) (page)->operations->swap_in ((page), v)

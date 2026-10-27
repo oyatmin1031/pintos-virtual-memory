@@ -43,6 +43,13 @@ struct fork_args {
 	bool success;
 };
 
+struct lazy_load_info {
+    struct file *file;
+    off_t offset;
+    size_t read_bytes;
+    size_t zero_bytes;
+};
+
 
 /* General process initializer for initd and other process. */
 static void
@@ -844,6 +851,7 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
 			palloc_free_page (kpage);
 			return false;
 		}
+
 
 		/* Advance. */
 		read_bytes -= page_read_bytes;
