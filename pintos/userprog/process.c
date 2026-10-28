@@ -43,16 +43,6 @@ struct fork_args {
 	bool success;
 };
 
-/* 문서의 aux: 최초 접근 때 실행 파일을 읽기 위해 페이지마다 보관하는 정보.
- * load_segment()는 이 정보를 준비하고, lazy_load_segment()가 나중에 사용한다. */
-struct lazy_load_info {
-    struct file *file;    /* 읽을 실행 파일의 참조. 파일 내용 자체를 복사하는 것은 아니다. */
-    off_t offset;        /* 이 페이지의 데이터를 읽기 시작할 파일 내 바이트 위치. */
-    size_t read_bytes;   /* 파일에서 읽어 프레임에 채울 바이트 수. */
-    size_t zero_bytes;   /* 프레임의 나머지 부분을 0으로 채울 바이트 수. */
-};
-
-
 /* General process initializer for initd and other process. */
 static void
 process_init (void) {
@@ -209,6 +199,11 @@ __do_fork (void *aux) {
 	memcpy (&if_, parent_if, sizeof (struct intr_frame));
 	if_.R.rax = 0;
 
+#ifdef VM
+	/* 이후 어떤 단계에서 실패해도 process_cleanup이 유효한 SPT를 정리하도록 한다. */
+	supplemental_page_table_init (&current->spt);
+#endif
+
 	/* 2. Duplicate PT */
 	current->pml4 = pml4_create();
 	if (current->pml4 == NULL)
@@ -216,7 +211,14 @@ __do_fork (void *aux) {
 
 	process_activate (current);
 #ifdef VM
-	supplemental_page_table_init (&current->spt);
+	/* 자식 aux가 빌려 쓸 실행 파일은 SPT 복사 전에 확보해야 한다. */
+	if (parent->running_file != NULL) {
+		lock_acquire (&file_lock);
+		current->running_file = file_duplicate (parent->running_file);
+		lock_release (&file_lock);
+		if (current->running_file == NULL)
+			goto error;
+	}
 	if (!supplemental_page_table_copy (&current->spt, &parent->spt))
 		goto error;
 #else
@@ -233,18 +235,21 @@ __do_fork (void *aux) {
 
 	/* Finally, switch to the newly created process. */
 	if (succ) {
+#ifndef VM
 		if (parent->running_file != NULL) {
 			/* running file 추가 */
 			lock_acquire(&file_lock);
 			current->running_file = file_duplicate(parent->running_file);
 			lock_release(&file_lock);
 		}
+#endif
 		sema_up(&((struct fork_args *)aux)->sema);
 		do_iret (&if_);
 	}
 error:
 	((struct fork_args *)aux)->success = false;
-	file_close(current->running_file);
+	/* thread_exit -> process_exit -> process_cleanup에서 SPT와 실행 파일을 정리한다.
+	 * 여기서 먼저 파일을 닫으면 cleanup에서 같은 참조를 다시 닫게 된다. */
 	sema_up(&((struct fork_args *)aux)->sema);
 	thread_exit ();
 }
@@ -346,6 +351,13 @@ process_exec (void *f_name) {
 
 	/* We first kill the current context */
 	process_cleanup ();
+
+#ifdef VM
+	/* cleanup에서 기존 SPT의 page들과 해시 버킷을 해제했다.
+	 * 새 프로그램의 page를 등록할 빈 SPT를 다시 준비한다.
+	 * exit은 재사용하지 않으므로 이 초기화는 exec 경로에서만 수행한다. */
+	supplemental_page_table_init (&thread_current ()->spt);
+#endif
 
 	/* And then load the binary */
 	lock_acquire(&file_lock);

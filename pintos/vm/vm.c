@@ -1,9 +1,11 @@
 /* vm.c: Generic interface for virtual memory objects. */
 
+#include <string.h>
 #include "threads/malloc.h"
 #include "vm/vm.h"
 #include "vm/inspect.h"
 #include "threads/vaddr.h"
+#include "userprog/process.h"
 
 /* 문서의 page_hash 예제: 가상 페이지 주소를 해시값으로 바꾼다.
  * 해시 테이블은 이 값으로 버킷을 선택한다. 해시값을 page에 저장하지는 않는다. */
@@ -110,7 +112,6 @@ vm_alloc_page_with_initializer (enum vm_type type, void *upage, bool writable,
 	/* uninit_new가 page 전체를 초기화하므로 추가 필드인 쓰기 권한은 그 뒤에 저장한다. */
 	page->writable = writable;
 	
-
 
 	/* 등록한 주소로 이후 최초 접근에서 page를 찾을 수 있도록 SPT에 넣는다. */
 	if(spt_insert_page(spt,page) == false){
@@ -326,18 +327,101 @@ supplemental_page_table_init (struct supplemental_page_table *spt UNUSED) {
 
 /* Copy supplemental page table from src to dst */
 bool
-supplemental_page_table_copy (struct supplemental_page_table *dst UNUSED,
-		struct supplemental_page_table *src UNUSED) {
-			
+supplemental_page_table_copy (struct supplemental_page_table *dst UNUSED, struct supplemental_page_table *src UNUSED){
+	/* 페이지 생성 함수는 현재 스레드의 SPT에 등록하므로 자식 문맥에서 호출한다. */
+	ASSERT (dst == &thread_current ()->spt);
 
+	struct hash_iterator i;	
+	struct hash_elem *e;
+	hash_first (&i, &src->pages);
 
+	while ((e = hash_next (&i)) != NULL) {
+    	struct page *page = hash_entry (e, struct page, hash_elem);
+		switch(page->operations->type){
+			case VM_UNINIT: {
+				/* 현재는 실행 파일용 anonymous 페이지의 로딩 정보만 복사한다. */
+				if (VM_TYPE (page->uninit.type) != VM_ANON)
+					return false;
+				/* 부모에게 로딩 정보가 없는 경우 자식도 NULL을 전달한다. */
+				struct lazy_load_info *child_aux = NULL;
+				if (page->uninit.aux != NULL) {
+					/* 현재 loader의 aux는 lazy_load_info이다.
+					 * 구조체를 따로 만들어 부모가 aux를 해제해도 자식은 유지한다. */
+					const struct lazy_load_info *parent_aux = page->uninit.aux;
+					child_aux = malloc (sizeof *child_aux);
+					if (child_aux == NULL)
+						return false;
+					*child_aux = *parent_aux;
 
+					/* file 포인터는 값 복사만 하면 부모의 파일을 가리킨다.
+					 * fork가 미리 복제한 자식 실행 파일을 빌려 사용하도록 바꾼다. */
+					child_aux->file = thread_current ()->running_file;
+					if (child_aux->file == NULL) {
+						free (child_aux);
+						return false;
+					}
+				}
 
+				/* aux의 유무와 관계없이 자식 page는 등록해야 한다. */
+				if (!vm_alloc_page_with_initializer (
+					page->uninit.type,  /* 부모 페이지가 초기화될 최종 타입 */
+					page->va,          /* 같은 사용자 가상 주소 */
+					page->writable,    /* 같은 쓰기 권한 */
+					page->uninit.init,  /* 나중에 내용을 로딩할 함수 */
+					child_aux          /* 별도로 복제한 자식용 로딩 정보 */
+				)) {
+					/* 등록 성공 전까지 aux는 이 복사 코드가 소유한다. */
+					free (child_aux);
+					return false;
+				}
+				break;
+			}
+			case VM_ANON:
+			if (!vm_alloc_page (VM_ANON, page->va, page->writable))
+    			return false;
+			if (!vm_claim_page (page->va))
+    			return false;
+			struct page *child_page = spt_find_page (dst, page->va);
+			memcpy(child_page->frame->kva,page->frame->kva,PGSIZE);
+			break;
+
+			case VM_FILE:
+				return false;
+
+			default:
+				/* 다음 구현 대상. 아직 복사하지 않은 타입을 성공으로 처리하지 않는다. */
+				return false;
+		}
+}
+	return true;
 }
 
 /* Free the resource hold by the supplemental page table */
 void
 supplemental_page_table_kill (struct supplemental_page_table *spt UNUSED) {
-	/* TODO: Destroy all the supplemental_page_table hold by thread and
-	 * TODO: writeback all the modified contents to the storage. */
+	/* 전체 SPT를 순회할 상태와 현재 가져온 해시 요소의 주소를 준비한다. */
+	struct hash_iterator i;
+	struct hash_elem *e;
+
+	/* 이 SPT의 pages 해시 테이블을 순회하도록 준비한다. 아직 요소를 가져오지는 않는다. */
+	hash_first (&i, &spt->pages);
+
+	/* 다음 요소가 있으면 e에 저장한다. 모든 요소가 없어지면 NULL이 되어 끝난다. */
+	while ((e = hash_next (&i)) != NULL) {
+		/* 해시 연결 요소를 포함하고 있는 원래 page 구조체의 주소를 구한다. */
+		struct page *page = hash_entry (e, struct page, hash_elem);
+		/* page 메모리를 해제하기 전에 버킷 리스트에서 연결을 먼저 제거한다.
+		 * hash_delete 자체는 page를 free하지 않는다. */
+		hash_delete (&spt->pages, e);
+		/* operations의 destroy로 aux/frame 관리 정보를 정리하고 page도 free한다. */
+		vm_dealloc_page(page);
+		/* hash_delete가 iterator를 무효로 만들므로 남은 테이블의 처음부터 다시 준비한다. */
+		hash_first(&i,&spt->pages);
+	}
+	/* 모든 page는 위에서 해제했다. NULL 콜백으로 버킷 배열만 반환한다.
+	 * thread 안에 들어 있는 spt 구조체 자체를 free하는 것은 아니다. */
+	hash_destroy (&spt->pages, NULL);
+	/* 현재 소유권 설계에서 PML4와 매핑된 물리 페이지는 호출자가 이후 정리한다.
+	 * exec이 이 SPT를 다시 쓰려면 새 프로그램 로딩 전에 재초기화해야 한다. */
+
 }

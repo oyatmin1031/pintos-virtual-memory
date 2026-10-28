@@ -535,7 +535,7 @@ static bool is_invaild_filename(char * filename){
 
 static bool is_valid_buffer(char *buffer, int size, void *arg) {
 	struct thread *curr = thread_current();
-	if (buffer == arg || is_kernel_vaddr(buffer + size) || pml4_get_page(curr->pml4, buffer) == NULL) {
+	if (buffer == arg || is_kernel_vaddr(buffer + size) || spt_find_page(&curr->spt, buffer) == NULL) {
 		return false;
 	}
 	return true;

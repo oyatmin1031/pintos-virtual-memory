@@ -10,6 +10,7 @@
 
 #include "vm/vm.h"
 #include "vm/uninit.h"
+#include "threads/malloc.h"
 
 static bool uninit_initialize (struct page *page, void *kva);
 static void uninit_destroy (struct page *page);
@@ -62,14 +63,18 @@ uninit_initialize (struct page *page, void *kva) {
  * PAGE will be freed by the caller. */
 static void
 uninit_destroy (struct page *page) {
+	/* 새로 할당하는 것이 아니라, page 내부의 미초기화 관리 정보를 가리킨다. */
 	struct uninit_page *uninit UNUSED = &page->uninit;
-	/* TODO: Fill this function.
-	 * TODO: If you don't have anything to do, just return. */
-	//정리할 로딩 정보가 없으면 여기서 끝낸다
+	/* 스택처럼 aux가 없는 페이지라면 해제할 로딩 정보가 없다. */
 	if(uninit ->aux == NULL){
 		return;
 	}
+	/* load_segment에서 동적 할당한 로딩 정보 전체를 반환한다.
+	 * 그 안의 file은 프로세스에서 빌려 쓴 참조이므로 여기서 닫지 않는다. */
 	free(uninit->aux);
+	/* free는 포인터 값을 바꾸지 않으므로 해제된 주소가 남지 않도록 정리한다. */
 	uninit->aux = NULL;
+	/* uninit은 page 내부 공간이므로 따로 free하지 않는다.
+	 * page 구조체 자체의 free는 호출자인 vm_dealloc_page가 수행한다. */
 
 }

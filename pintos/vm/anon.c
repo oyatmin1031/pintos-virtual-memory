@@ -2,6 +2,8 @@
 
 #include "vm/vm.h"
 #include "devices/disk.h"
+#include "threads/malloc.h"
+
 
 /* DO NOT MODIFY BELOW LINE */
 static struct disk *swap_disk;
@@ -53,6 +55,21 @@ anon_swap_out (struct page *page) {
 /* Destroy the anonymous page. PAGE will be freed by the caller. */
 static void
 anon_destroy (struct page *page) {
+	/* anonymous 전용 관리 정보의 주소. 현재 구조체는 비어 있어 아직 사용하지 않는다. */
 	struct anon_page *anon_page = &page->anon;
-	
+	/* page->frame에 이미 저장된 frame 구조체의 주소를 가져온다.
+	 * &page->frame은 포인터 멤버의 주소이므로 여기서 사용할 값이 아니다. */
+	struct frame *frame = page->frame;
+	/* 연결된 frame 관리 구조체가 있을 때만 정리한다. */
+	if(page->frame != NULL){
+		/* frame에서 page로 향하는 역방향 연결을 끊는다. */
+		frame->page = NULL;
+		/* malloc으로 만든 관리 구조체만 반환한다.
+		 * 현재 종료 흐름에서 실제 물리 페이지는 이후 pml4_destroy가 반환한다. */
+		free(frame);
+		/* page가 해제된 frame 구조체를 계속 가리키지 않도록 한다. */
+		page->frame = NULL;
+
+	}
+	/* page 자체는 vm_dealloc_page가 해제하므로 여기서 다시 free하지 않는다. */
 }
