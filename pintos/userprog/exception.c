@@ -140,14 +140,12 @@ page_fault (struct intr_frame *f) {
 	write = (f->error_code & PF_W) != 0;
 	user = (f->error_code & PF_U) != 0;
 
-	if( not_present || write || user ) {
-		thread_exit();
-	}
+	
 
 #ifdef VM
-	/* For project 3 and later. */
-	if (vm_try_handle_fault (f, fault_addr, user, write, not_present))
-		return;
+    /* 처리 가능한 page fault면 로딩 후 실행을 재개한다. */
+    if (vm_try_handle_fault (f, fault_addr, user, write, not_present))
+        return;
 #endif
 
 	/* Count page faults. */

@@ -43,11 +43,13 @@ struct fork_args {
 	bool success;
 };
 
+/* 문서의 aux: 최초 접근 때 실행 파일을 읽기 위해 페이지마다 보관하는 정보.
+ * load_segment()는 이 정보를 준비하고, lazy_load_segment()가 나중에 사용한다. */
 struct lazy_load_info {
-    struct file *file;
-    off_t offset;
-    size_t read_bytes;
-    size_t zero_bytes;
+    struct file *file;    /* 읽을 실행 파일의 참조. 파일 내용 자체를 복사하는 것은 아니다. */
+    off_t offset;        /* 이 페이지의 데이터를 읽기 시작할 파일 내 바이트 위치. */
+    size_t read_bytes;   /* 파일에서 읽어 프레임에 채울 바이트 수. */
+    size_t zero_bytes;   /* 프레임의 나머지 부분을 0으로 채울 바이트 수. */
 };
 
 
@@ -903,10 +905,40 @@ install_page (void *upage, void *kpage, bool writable) {
 
 static bool
 lazy_load_segment (struct page *page, void *aux) {
-	/* TODO: Load the segment from the file */
-	/* TODO: This called when the first page fault occurs on address VA. */
-	/* TODO: VA is available when calling this function. */
+	/* 최초 claim 때 aux에 보관한 로딩 정보를 사용해 프레임의 내용을 채운다. */
+	struct lazy_load_info *info = (struct lazy_load_info *)aux;
+
+    // 1. 실제 데이터를 저장할 프레임 주소
+    uint8_t *kva = (uint8_t *)page->frame->kva;
+
+    /* 파일 연산을 보호한다. 이미 호출자가 file_lock을 잡고 있으면 재획득하지 않는다.
+     * 이 함수에서 직접 획득한 경우에만 아래에서 해제한다. */
+    bool need_lock = !lock_held_by_current_thread (&file_lock);
+    if (need_lock)
+        lock_acquire (&file_lock);
+
+    // 2. 실행 파일에서 데이터 읽기
+    off_t bytes_read = file_read_at(info->file,kva,info->read_bytes,info->offset);
+
+    if (need_lock)
+        lock_release (&file_lock);
+
+    // 3. 읽기에 실패했다면
+    if (bytes_read != (off_t)info->read_bytes) {
+        free(info);
+        return false;
+    }
+
+    // 4. 나머지 메모리를 0으로 초기화
+    memset(kva + info->read_bytes, 0, info->zero_bytes);
+
+    // 5. 로딩 정보 해제
+    free(info);
+
+    return true;
 }
+	
+
 
 /* Loads a segment starting at offset OFS in FILE at address
  * UPAGE.  In total, READ_BYTES + ZERO_BYTES bytes of virtual
@@ -925,43 +957,91 @@ lazy_load_segment (struct page *page, void *aux) {
 static bool
 load_segment (struct file *file, off_t ofs, uint8_t *upage,
 		uint32_t read_bytes, uint32_t zero_bytes, bool writable) {
+	/* segment 전체 크기는 4KB 페이지 단위여야 한다. ASSERT는 조건만 검사한다. */
 	ASSERT ((read_bytes + zero_bytes) % PGSIZE == 0);
+	/* 등록할 사용자 가상 주소는 페이지 시작 주소여야 한다. */
 	ASSERT (pg_ofs (upage) == 0);
+	/* segment를 처음 읽기 시작할 파일 위치도 페이지 단위로 정렬돼 있어야 한다. */
 	ASSERT (ofs % PGSIZE == 0);
 
+	/* 파일 데이터 또는 0 채움 영역이 남아 있는 동안 한 번에 한 페이지씩 등록한다. */
 	while (read_bytes > 0 || zero_bytes > 0) {
 		/* Do calculate how to fill this page.
 		 * We will read PAGE_READ_BYTES bytes from FILE
 		 * and zero the final PAGE_ZERO_BYTES bytes. */
+		/* 남은 파일 데이터와 한 페이지 크기 중 작은 값을 선택한다. */
 		size_t page_read_bytes = read_bytes < PGSIZE ? read_bytes : PGSIZE;
+		/* 파일 데이터를 제외한 나머지 공간은 나중에 0으로 채운다. */
 		size_t page_zero_bytes = PGSIZE - page_read_bytes;
 
 		/* TODO: Set up aux to pass information to the lazy_load_segment. */
-		void *aux = NULL;
-		if (!vm_alloc_page_with_initializer (VM_ANON, upage,
-					writable, lazy_load_segment, aux))
+		/* 지역 변수의 주소를 넘기면 함수 종료 후 사용할 수 없으므로,
+		 * 나중의 최초 접근까지 유지될 페이지별 로딩 정보를 동적 할당한다. */
+		struct lazy_load_info *aux = malloc (sizeof *aux);
+		/* 로딩 정보를 할당하지 못했으면 이 segment의 등록을 중단한다. */
+		if (aux == NULL)
 			return false;
 
+		/* 파일은 나중에도 열려 있어야 한다. 여기서는 포인터만 보관한다. */
+		aux->file = file;
+		/* 다음 반복에서 ofs가 바뀌기 전에 현재 페이지의 읽기 위치를 저장한다. */
+		aux->offset = ofs;
+		/* 이번 4KB 페이지 중 파일 데이터로 채울 크기를 저장한다. */
+		aux->read_bytes = page_read_bytes;
+		/* 나머지 공간의 크기. read_bytes와 합하면 PGSIZE가 된다. */
+		aux->zero_bytes = page_zero_bytes;
+
+		/* 최종 타입 VM_ANON, 사용자 주소 upage, 쓰기 권한 writable을 전달한다.
+		 * lazy_load_segment는 지금 실행하지 않고 최초 claim 때 호출하도록 등록한다.
+		 * 이 단계에서는 page 정보만 SPT에 넣고 물리 프레임은 할당하지 않는다. */
+		if (!vm_alloc_page_with_initializer (VM_ANON, upage, writable, lazy_load_segment, aux)) {
+			/* 등록 실패: aux를 맡길 page가 없으므로 호출한 쪽에서 해제한다. */
+			free (aux);
+			return false;
+		}
+		/* 등록 성공: page가 aux를 보관하므로 여기서는 해제하지 않는다.
+		 * 추후 lazy loader 또는 미초기화 페이지의 종료 정리에서 해제해야 한다. */
+
 		/* Advance. */
+		/* segment 전체에서 아직 등록하지 않은 파일 데이터 크기를 줄인다. */
 		read_bytes -= page_read_bytes;
+		/* 아직 등록하지 않은 0 채움 영역의 크기도 줄인다. */
 		zero_bytes -= page_zero_bytes;
+		/* 다음 사용자 가상 페이지의 시작 주소로 이동한다. */
 		upage += PGSIZE;
+		/* 다음 페이지에 사용할 파일 위치를 실제 읽을 크기만큼 이동한다. */
+		ofs += page_read_bytes;
 	}
+	
+	/* 모든 페이지의 로딩 정보를 등록했다는 뜻이며, 실제 로딩 완료는 아니다. */
 	return true;
 }
 
 /* Create a PAGE of stack at the USER_STACK. Return true on success. */
 static bool
 setup_stack (struct intr_frame *if_) {
-	bool success = false;
-	void *stack_bottom = (void *) (((uint8_t *) USER_STACK) - PGSIZE);
+	void *stack_bottom = (uint8_t *) USER_STACK - PGSIZE;
+	struct supplemental_page_table *spt = &thread_current ()->spt;
 
-	/* TODO: Map the stack on stack_bottom and claim the page immediately.
-	 * TODO: If success, set the rsp accordingly.
-	 * TODO: You should mark the page is stack. */
-	/* TODO: Your code goes here */
+	/* 첫 스택 페이지를 SPT에 등록한다. */
+	if (!vm_alloc_page (VM_ANON | VM_MARKER_0, stack_bottom, true))
+		return false;
 
-	return success;
+	/* 즉시 프레임을 확보하고 매핑한다. */
+	if (!vm_claim_page (stack_bottom)) {
+		struct page *page = spt_find_page (spt, stack_bottom);
+		spt_remove_page (spt, page);
+		return false;
+	}
+
+	/* 확보한 스택 페이지를 0으로 채운다. */
+	struct page *page = spt_find_page (spt, stack_bottom);
+	memset (page->frame->kva, 0, PGSIZE);
+
+	/* 인자를 넣기 전의 초기 스택 위치를 설정한다. */
+	if_->rsp = USER_STACK;
+
+	return true;
 }
 #endif /* VM */
 

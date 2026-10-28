@@ -65,4 +65,11 @@ uninit_destroy (struct page *page) {
 	struct uninit_page *uninit UNUSED = &page->uninit;
 	/* TODO: Fill this function.
 	 * TODO: If you don't have anything to do, just return. */
+	//정리할 로딩 정보가 없으면 여기서 끝낸다
+	if(uninit ->aux == NULL){
+		return;
+	}
+	free(uninit->aux);
+	uninit->aux = NULL;
+
 }

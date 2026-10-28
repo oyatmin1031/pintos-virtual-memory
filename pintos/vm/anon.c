@@ -28,9 +28,13 @@ vm_anon_init (void) {
 /* Initialize the file mapping */
 bool
 anon_initializer (struct page *page, enum vm_type type, void *kva) {
-	/* Set up the handler */
-	//이 페이지를 VM_ANON으로 관리하도록 전환
+	/* 최초 UNINIT 페이지의 uninit_initialize가 호출하는 타입 초기화 함수.
+	 * anon_ops에는 VM_ANON 타입과 anonymous용 swap_in/out/destroy가 들어 있다.
+	 * 포인터를 교체하면 이 page는 이후 anonymous 방식으로 관리된다. */
 	page->operations = &anon_ops;
+	/* 현재 anon_page는 비어 있으므로 추가 상태 초기화가 없다.
+	 * 성공을 반환하면 uninit_initialize가 다음으로 lazy_load_segment 같은
+	 * 내용 로딩 콜백을 실행한다. 이 함수 자체에서 파일 내용을 읽지는 않는다. */
 	return true;
 }
 
@@ -50,4 +54,5 @@ anon_swap_out (struct page *page) {
 static void
 anon_destroy (struct page *page) {
 	struct anon_page *anon_page = &page->anon;
+	
 }

@@ -47,10 +47,11 @@ struct page {
 	void *va;              /* Address in terms of user space */
 	struct frame *frame;   /* Back reference for frame */
 
-	struct hash_elem hash_elem;  /* SPT 해시 테이블에 연결할 요소 */
+	/* 내부 list_elem을 통해 이 page를 SPT의 버킷 리스트에 연결한다. */
+	struct hash_elem hash_elem;
 
 	/* Your implementation */
-	bool writable; /* 읽고 쓰기한거?*/
+	bool writable; /* 사용자 쓰기 허용 여부. PML4 매핑의 rw 인자로 사용한다. */
 
 	/* Per-type data are binded into the union.
 	 * Each function automatically detects the current union */
@@ -90,6 +91,7 @@ struct page_operations {
  * We don't want to force you to obey any specific design for this struct.
  * All designs up to you for this. */
 struct supplemental_page_table {
+	/* 프로세스별 해시 테이블. 키는 page->va이고 연결 요소는 page->hash_elem이다. */
 	struct hash pages;
 };
 
