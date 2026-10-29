@@ -122,6 +122,8 @@ typedef int tid_t;
 #ifdef VM
 	/* Table for whole virtual memory owned by thread. */
 	struct supplemental_page_table spt;
+	/* 시스템콜 진입 시의 사용자 스택 포인터를 보관한다. */
+	uintptr_t user_rsp;
 #endif
 
 	/* Owned by thread.c. */

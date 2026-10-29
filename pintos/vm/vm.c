@@ -219,9 +219,32 @@ vm_get_frame (void) {
 	return frame;
 }
 
-/* Growing the stack. */
+/* 허용된 스택 주소에 페이지를 생성하고 실제 메모리를 준비한다. */
 static void
-vm_stack_growth (void *addr UNUSED) {
+vm_stack_growth (void *addr) {
+	struct supplemental_page_table *spt = &thread_current ()->spt;
+
+	addr = pg_round_down (addr);
+
+	struct page *page = spt_find_page (spt, addr);
+	if (page != NULL)
+		return;
+
+	/* 쓰기 가능한 anonymous 스택 페이지를 등록한다. */
+	if (!vm_alloc_page (VM_ANON | VM_MARKER_0, addr, true))
+		return;
+
+	/* 등록된 페이지의 주소를 page 변수에 새로 저장한다. */
+	page = spt_find_page (spt, addr);
+
+	/* frame 확보·매핑에 실패하면 등록한 페이지도 정리한다. */
+	if (!vm_claim_page (addr)) {
+		spt_remove_page (spt, page);
+		return;
+	}
+
+	/* 새 스택 페이지를 0으로 초기화한다. */
+	memset (page->frame->kva, 0, PGSIZE);
 }
 
 /* Handle the fault on write_protected page */
@@ -229,38 +252,75 @@ static bool
 vm_handle_wp (struct page *page UNUSED) {
 }
 
-/* Return true on success */
+/* 잘못된 접근은 거부하고, 스택 성장 또는 기존 페이지 로딩으로 fault를 복구한다.
+ * 복구에 성공하면 true를 반환한다. */
 bool
-vm_try_handle_fault(struct intr_frame *f UNUSED, void *addr,
-                    bool user UNUSED, bool write, bool not_present) {
+vm_try_handle_fault (struct intr_frame *f, void *addr,
+		bool user, bool write, bool not_present) {
+	struct thread *curr = thread_current ();
+	struct supplemental_page_table *spt = &curr->spt;
 
-    struct supplemental_page_table *spt = &thread_current()->spt;
-    struct page *page = NULL;
+	/* NULL이나 커널 주소에 대한 접근은 허용하지 않는다. */
+	if (addr == NULL || !is_user_vaddr (addr))
+		return false;
 
-    // 1. 유효한 사용자 가상 주소인지 확인
-    if (addr == NULL || !is_user_vaddr(addr))
-        return false;
+	/* 권한 위반은 페이지를 새로 할당해서 해결하지 않는다. */
+	if (!not_present)
+		return false;
 
-    // 2. 매핑되지 않은 페이지 때문에 발생한 Fault인지 확인
-	//not_present = 페이지 부재로 발생한 fault이면 true
-    if (!not_present)
-        return false;
+	struct page *page = spt_find_page (spt, addr);
 
-    // 3. SPT에서 페이지 검색
-    page = spt_find_page(spt, addr);
+	if (page == NULL) {
+		/* 커널 fault에서는 저장해 둔 사용자 rsp를 사용한다. */
+		uintptr_t user_rsp = user ? (uintptr_t) f->rsp : curr->user_rsp;
 
-    if (page == NULL)
-        return false;
+		uintptr_t fault_addr = (uintptr_t) addr;
 
-    // 4. 쓰기 권한 확인
-    if (write && !page->writable)
-        return false;
+		/* 스택은 USER_STACK 아래 최대 1MB까지 허용한다. */
+		if (fault_addr < (uintptr_t) USER_STACK - (1UL << 20)
+			|| fault_addr >= (uintptr_t) USER_STACK)
+			return false;
 
-    // 5. 실제 RAM 프레임 할당 및 페이지 로딩
-    return vm_do_claim_page(page);
+		/* PUSH가 rsp를 갱신하기 전에 접근하는 rsp - 8도 허용한다.
+		 * user_rsp < 8 검사는 뺄셈에서 정수가 넘치는 것을 막는다. */
+		if (user_rsp < 8 || fault_addr < user_rsp - 8)
+			return false;
+
+		/* 정상적인 스택 접근이면 새 페이지를 생성하고 claim한다. */
+		vm_stack_growth (addr);
+
+		/* growth는 void 함수이므로 등록·frame·매핑 결과를 차례로 확인한다.
+		 * 이미 claim했으므로 여기서 다시 claim하지 않는다. */
+		page = spt_find_page (spt, addr);
+		if (page == NULL)
+			return false;
+
+		/* 실제 물리 프레임이 연결됐는지 확인한다. */
+		if (page->frame == NULL)
+			return false;
+
+		/* 사용자 주소에 매핑됐는지 확인한다. */
+		if (pml4_get_page (curr->pml4, addr) == NULL)
+			return false;
+
+		return true;
+	}
+
+	/* 기존 페이지에 쓰려면 쓰기 권한이 있어야 한다. */
+	if (write && !page->writable)
+		return false;
+
+	/* 이미 frame이 있으면 중복 할당하지 않고 매핑을 확인한다. */
+	if (page->frame != NULL) {
+		if (pml4_get_page (curr->pml4, addr) == NULL)
+			return false;
+
+		return true;
+	}
+
+	/* SPT에 등록되어 있지만 아직 RAM에 없는 페이지를 로딩한다. */
+	return vm_do_claim_page (page);
 }
-	
-	
 
 /* Free the page.
  * DO NOT MODIFY THIS FUNCTION. */

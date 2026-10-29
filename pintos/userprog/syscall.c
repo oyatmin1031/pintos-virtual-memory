@@ -76,7 +76,11 @@ syscall_init (void) {
 
 /* The main system call interface */
 void
-syscall_handler (struct intr_frame *f UNUSED) {
+syscall_handler (struct intr_frame *f) {
+#ifdef VM
+	/* 커널에서 참고할 사용자 스택 포인터를 저장한다. */
+	thread_current ()->user_rsp = (uintptr_t) f->rsp;
+#endif
 
 	uint64_t syscall_num = f->R.rax;
 	switch (syscall_num){
@@ -552,6 +556,17 @@ user_page_ready (const void *addr, bool writable) {
 	struct thread *curr = thread_current ();
 #ifdef VM
 	struct page *page = spt_find_page (&curr->spt, (void *) addr);
+	if (page == NULL) {
+		/* 아직 SPT에 없더라도 정상적인 스택 접근일 수 있다.
+		 * fault 처리와 같은 성장 조건을 사용해 페이지를 준비한다.
+		 * user=false이므로 f 대신 시스템콜 진입 때 저장한 user_rsp를 사용한다.
+		 * not_present=true는 현재 페이지가 없다는 뜻이다. */
+		if (!vm_try_handle_fault (NULL, (void *) addr, false, writable, true))
+			return false;
+
+		/* 성장 과정에서 등록한 페이지를 가져와 아래 권한 검사도 수행한다. */
+		page = spt_find_page (&curr->spt, (void *) addr);
+	}
 	if (page == NULL || (writable && !page->writable))
 		return false;
 	/* SPT에만 등록된 lazy 페이지는 정상 주소다. 파일 락을 잡기 전에 claim한다. */
