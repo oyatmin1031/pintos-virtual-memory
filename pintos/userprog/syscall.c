@@ -17,6 +17,7 @@
 #include "filesys/filesys.h"
 #include "devices/input.h"
 #include "threads/palloc.h"
+#include "threads/mmu.h"
 
 void syscall_entry (void);
 void syscall_handler (struct intr_frame *);
@@ -39,7 +40,9 @@ void syscall_handler (struct intr_frame *);
 static bool is_invaild_filename(char * filename);
 static struct fd_info * seek_fd_info (struct thread *curr, int fd);
 static struct fd_info * dup_fd_info(struct fd_info *oldfd_info, int newfd);
-static bool is_valid_buffer(char *buffer, int size, void* arg);
+static bool user_page_ready (const void *addr, bool writable);
+static void check_user_string (const char *str, size_t limit);
+static bool is_valid_buffer (const void *buffer, size_t size, bool writable);
 
 static void sys_halt (struct intr_frame *f);
 static void sys_exit (struct intr_frame *f);
@@ -161,6 +164,8 @@ sys_fork (struct intr_frame *f) {
 static void 
 sys_exec (struct intr_frame *f) {
 	char *fname = (void *)f->R.rdi;
+	/* strlcpy가 읽을 범위를 먼저 확인한다. 잘못된 주소를 커널에서 읽으면 안 된다. */
+	check_user_string (fname, PAGE_SIZE);
 	char *buffer = palloc_get_page(0);
 
 	if (buffer == NULL){
@@ -241,7 +246,8 @@ sys_open (struct intr_frame *f) {
 		thread_exit();
 	}
 	
-	if (!is_valid_buffer(fname, strlen(fname), '\0') || is_invaild_filename(fname)) {
+	/* 길이를 재려고 strlen부터 호출하면 주소 검사 전에 fault가 발생한다. */
+	if (is_invaild_filename(fname)) {
 		f->R.rax = -1;       
 		return;
 	}
@@ -298,7 +304,8 @@ sys_read (struct intr_frame *f) {
 	char *buffer = (char *)f->R.rsi;
 	unsigned size = f->R.rdx;
 
-	if(!is_valid_buffer(buffer, size, '\0')){
+	/* read는 사용자 버퍼에 쓰므로 모든 페이지에 쓰기 권한도 필요하다. */
+	if(!is_valid_buffer(buffer, size, true)){
 		thread_current()->exit_status = -1;
 		thread_exit();
 	}
@@ -382,7 +389,8 @@ sys_write (struct intr_frame *f) {
 	int fd = f->R.rdi;
 	uint64_t size = f->R.rdx;
 
-	if (!is_valid_buffer(buffer, size, NULL)) {
+	/* write는 사용자 버퍼를 읽기만 하므로 읽기 전용 페이지도 허용한다. */
+	if (!is_valid_buffer(buffer, size, false)) {
 		thread_current()->exit_status = -1;
 		thread_exit(); // 접근하면 안 되는 포인터를 주면 프로세스 종료 
 		
@@ -529,16 +537,73 @@ static struct fd_info * dup_fd_info(struct fd_info *oldfd_info, int newfd) {
 
 static bool is_invaild_filename(char * filename){
 	size_t size;
+	/* create/open/remove/fork가 공유하는 문자열 검사 지점이다.
+	 * strnlen이 실제로 읽기 전에 페이지가 유효하고 RAM에 있는지 확인한다. */
+	check_user_string (filename, NAME_MAX + 1);
 	size = strnlen(filename, NAME_MAX+1);
 	return !((size > 0) && (size <= (NAME_MAX)));
 }
 
-static bool is_valid_buffer(char *buffer, int size, void *arg) {
-	struct thread *curr = thread_current();
-	if (buffer == arg || is_kernel_vaddr(buffer + size) || spt_find_page(&curr->spt, buffer) == NULL) {
+/* 커널이 사용자 메모리를 읽거나 쓰기 전에 해당 페이지를 준비한다. */
+static bool
+user_page_ready (const void *addr, bool writable) {
+	if (addr == NULL || !is_user_vaddr (addr))
 		return false;
+	struct thread *curr = thread_current ();
+#ifdef VM
+	struct page *page = spt_find_page (&curr->spt, (void *) addr);
+	if (page == NULL || (writable && !page->writable))
+		return false;
+	/* SPT에만 등록된 lazy 페이지는 정상 주소다. 파일 락을 잡기 전에 claim한다. */
+	if (page->frame == NULL && !vm_claim_page (page->va))
+		return false;
+#else
+	/* Project 2 빌드는 SPT 대신 실제 페이지 테이블에서 확인한다. */
+	uint64_t *pte = pml4e_walk (curr->pml4, (uint64_t) addr, 0);
+	if (pte == NULL || (writable && !is_writable (pte)))
+		return false;
+#endif
+	return pml4_get_page (curr->pml4, addr) != NULL;
+}
+
+/* 문자열은 길이도 아직 모르므로, 검사한 페이지 안에서만 문자를 읽는다.
+ * limit까지 NUL이 없으면 길이 초과 판단은 기존 호출자가 맡는다. */
+static void
+check_user_string (const char *str, size_t limit) {
+	uintptr_t addr = (uintptr_t) str;
+	while (limit > 0) {
+		if (!user_page_ready ((const void *) addr, false)) {
+			thread_current ()->exit_status = -1;
+			thread_exit ();
+		}
+		size_t count = PGSIZE - pg_ofs (addr);
+		if (count > limit)
+			count = limit;
+		for (size_t i = 0; i < count; i++)
+			if (*(const char *) (addr + i) == '\0')
+				return;
+		addr += count;
+		limit -= count;
 	}
-	return true;
+}
+
+static bool
+is_valid_buffer (const void *buffer, size_t size, bool writable) {
+	uintptr_t start = (uintptr_t) buffer;
+	if (buffer == NULL || !is_user_vaddr (buffer))
+		return false;
+	if (size == 0)
+		return true;
+	/* 끝 주소 계산의 정수 넘침과 커널 주소 영역 침범을 먼저 막는다. */
+	if (size - 1 > (uintptr_t) KERN_BASE - 1 - start)
+		return false;
+	uintptr_t last = start + size - 1;
+	for (uintptr_t addr = start; ; addr = (uintptr_t) pg_round_down (addr) + PGSIZE) {
+		if (!user_page_ready ((const void *) addr, writable))
+			return false;
+		if (pg_round_down (addr) == pg_round_down (last))
+			return true;
+	}
 }
 
 static struct fd_info * seek_fd_info (struct thread *curr, int fd) {

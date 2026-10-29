@@ -151,6 +151,14 @@ page_fault (struct intr_frame *f) {
 	/* Count page faults. */
 	page_fault_cnt++;
 
+	/* 정상적인 lazy loading은 위에서 먼저 복구한다.
+	 * 복구할 수 없는 사용자 접근은 해당 프로세스만 -1로 종료한다.
+	 * 커널 fault는 아래의 기존 진단 경로에 남겨 실제 커널 버그를 숨기지 않는다. */
+	if (user) {
+		thread_current ()->exit_status = -1;
+		thread_exit ();
+	}
+
 	/* If the fault is true fault, show info and exit. */
 	printf ("Page fault at %p: %s error %s page in %s context.\n",
 			fault_addr,
