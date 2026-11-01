@@ -5,6 +5,14 @@
 
 struct file;
 
+ /* 적재할 파일의 정보를 담은 구조체 */
+struct page_args {
+	struct file *file;		/* 파일 */
+	off_t offset;			/* 오프셋 */
+	size_t read_bytes;		/* 파일에서 읽을 크기 */
+	size_t zero_bytes;		/* 파일을 읽지 않고 0으로 채울 크기 */
+};
+
 tid_t process_create_initd (const char *file_name);
 tid_t process_fork (const char *name, struct intr_frame *if_);
 int process_exec (void *f_name);
