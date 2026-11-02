@@ -172,8 +172,14 @@ vm_get_frame (void) {
 }
 
 /* Growing the stack. */
-static void
+static bool
 vm_stack_growth (void *addr UNUSED) {
+	void *va = pg_round_down(addr);
+	if (!vm_alloc_page(VM_ANON, va, true)) {
+		return false;
+	}
+
+	return vm_claim_page(addr);
 }
 
 /* Handle the fault on write_protected page */
@@ -203,6 +209,14 @@ vm_try_handle_fault (struct intr_frame *f UNUSED, void *addr UNUSED,
 	/* 유효한 페이지 폴트인지 검사 */
 	page = spt_find_page(spt, addr);
 	if (page == NULL) {
+		/* 확장 가능한 접근인지 확인 
+		   1. 사용자 스택 범위 안인가?
+		   2. addr >= rsp - 8을 만족?
+		   3. 매핑되지 않은 페이지에 대한 접근인가? */
+		uintptr_t rsp = user ? f->rsp : thread_current()->rsp;
+		if (addr >= USER_STACK - (1<<20) && addr < USER_STACK && addr >= rsp - 8) {
+			return vm_stack_growth(addr);
+		}
 		return false;
 	}
 

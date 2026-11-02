@@ -75,7 +75,7 @@ syscall_init (void) {
 /* The main system call interface */
 void
 syscall_handler (struct intr_frame *f UNUSED) {
-
+	thread_current()->rsp = f->rsp;
 	uint64_t syscall_num = f->R.rax;
 	switch (syscall_num){
 		case SYS_HALT:
@@ -567,7 +567,8 @@ static bool is_valid_buffer(void *buffer, size_t size, bool is_need_write) {
 		struct page *page = spt_find_page(&curr->spt, addr);
 
 		if (page == NULL) {
-			return false;
+			/* 스택 확장이 가능하면 확장 */
+			return vm_try_handle_fault(NULL, addr, false, is_need_write, true);
 		}
 		if (is_need_write && !page->writable) {
 			return false;
