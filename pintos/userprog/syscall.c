@@ -39,7 +39,8 @@ void syscall_handler (struct intr_frame *);
 static bool is_invaild_filename(char * filename);
 static struct fd_info * seek_fd_info (struct thread *curr, int fd);
 static struct fd_info * dup_fd_info(struct fd_info *oldfd_info, int newfd);
-static bool is_valid_buffer(char *buffer, int size, void* arg);
+static bool is_valid_buffer(void *buffer, size_t size, bool is_need_write);
+static bool is_valid_string(char *fname);
 
 static void sys_halt (struct intr_frame *f);
 static void sys_exit (struct intr_frame *f);
@@ -74,7 +75,7 @@ syscall_init (void) {
 /* The main system call interface */
 void
 syscall_handler (struct intr_frame *f UNUSED) {
-
+	thread_current()->rsp = f->rsp;
 	uint64_t syscall_num = f->R.rax;
 	switch (syscall_num){
 		case SYS_HALT:
@@ -143,7 +144,12 @@ sys_exit (struct intr_frame *f) {
 static void 
 sys_fork (struct intr_frame *f) {
 	char *fname = (void *)f->R.rdi;	
-	
+
+	if (!is_valid_string(fname)) {
+		thread_current()->exit_status = -1;
+		thread_exit();
+	}
+
 	if(fname == NULL || is_kernel_vaddr(fname)) {
 		thread_current()->exit_status = -1;
 		thread_exit();
@@ -166,7 +172,12 @@ sys_exec (struct intr_frame *f) {
 	if (buffer == NULL){
 		f->R.rax = -1;
 		return;
-	}		
+	}
+	
+	if (!is_valid_string(fname)) {
+		thread_current()->exit_status = -1;
+		thread_exit();
+	}
 
 	/* 널문자까지 포함해서 page size여야함 */
 	if ((strlcpy(buffer, (const char *)fname, PAGE_SIZE)) >= PAGE_SIZE){
@@ -195,6 +206,11 @@ static void
 sys_create (struct intr_frame *f) {
 	char *fname = (char *)f->R.rdi;
 	unsigned int initsize = f->R.rsi;
+
+	if (!is_valid_string(fname)) {
+		thread_current()->exit_status = -1;
+		thread_exit();
+	}
 	
 	if (fname == '\0'  || is_kernel_vaddr(fname)) {
 		thread_current()->exit_status = -1;
@@ -214,6 +230,11 @@ sys_create (struct intr_frame *f) {
 static void 
 sys_remove (struct intr_frame *f) {
 	char *fname = (char *)f->R.rdi;
+
+	if (!is_valid_string(fname)) {
+		thread_current()->exit_status = -1;
+		thread_exit();
+	}
 
 	if(fname == NULL || is_kernel_vaddr(fname)) {
 		thread_current()->exit_status = -1;
@@ -236,12 +257,12 @@ sys_open (struct intr_frame *f) {
 
 	struct file *file;
 
-	if(fname == NULL || is_kernel_vaddr(fname)) {
+	if(fname == NULL || is_kernel_vaddr(fname) || !is_valid_string(fname)) {
 		thread_current()->exit_status = -1;
 		thread_exit();
 	}
 	
-	if (!is_valid_buffer(fname, strlen(fname), '\0') || is_invaild_filename(fname)) {
+	if (is_invaild_filename(fname)) {
 		f->R.rax = -1;       
 		return;
 	}
@@ -298,7 +319,7 @@ sys_read (struct intr_frame *f) {
 	char *buffer = (char *)f->R.rsi;
 	unsigned size = f->R.rdx;
 
-	if(!is_valid_buffer(buffer, size, '\0')){
+	if(!is_valid_buffer(buffer, size, true)){
 		thread_current()->exit_status = -1;
 		thread_exit();
 	}
@@ -382,7 +403,7 @@ sys_write (struct intr_frame *f) {
 	int fd = f->R.rdi;
 	uint64_t size = f->R.rdx;
 
-	if (!is_valid_buffer(buffer, size, NULL)) {
+	if (!is_valid_buffer(buffer, size, false)) {
 		thread_current()->exit_status = -1;
 		thread_exit(); // 접근하면 안 되는 포인터를 주면 프로세스 종료 
 		
@@ -533,12 +554,45 @@ static bool is_invaild_filename(char * filename){
 	return !((size > 0) && (size <= (NAME_MAX)));
 }
 
-static bool is_valid_buffer(char *buffer, int size, void *arg) {
+static bool is_valid_buffer(void *buffer, size_t size, bool is_need_write) {
 	struct thread *curr = thread_current();
-	if (buffer == arg || is_kernel_vaddr(buffer + size) || pml4_get_page(curr->pml4, buffer) == NULL) {
+	if (buffer == NULL || is_kernel_vaddr(buffer + size)) {
 		return false;
 	}
+
+	int64_t start = pg_round_down(buffer);
+	int64_t end = pg_round_down(buffer + size - 1);
+
+	for (int64_t addr = start; addr <= end; addr += PGSIZE) {
+		struct page *page = spt_find_page(&curr->spt, addr);
+
+		if (page == NULL) {
+			/* 스택 확장이 가능하면 확장 */
+			return vm_try_handle_fault(NULL, addr, false, is_need_write, true);
+		}
+		if (is_need_write && !page->writable) {
+			return false;
+		}
+		/* 유효하지만 아직 적재되지 않은 경우 */
+		if (pml4_get_page(curr->pml4, addr) == NULL && !vm_claim_page(addr)) {
+			return false;
+		}
+	}
+
 	return true;
+}
+
+static bool
+is_valid_string(char *fname) {
+	while (true) {
+		if (!is_valid_buffer(fname, 1, false))
+			return false;
+
+		if (*fname == '\0')
+			return true;
+
+		fname++;
+	}
 }
 
 static struct fd_info * seek_fd_info (struct thread *curr, int fd) {
