@@ -91,7 +91,7 @@ typedef int tid_t;
  * blocked state is on a semaphore wait list. */
 
 
- struct thread {
+struct thread {
 	/* Owned by thread.c. */
 	tid_t tid;                          /* Thread identifier. */
 	enum thread_status status;          /* Thread state. */
@@ -115,13 +115,17 @@ typedef int tid_t;
 	struct wait_info *my_info;
 	struct file *running_file;			/* 현재 실행중인 파일 */
 
-#ifdef USERPROG
+	uint64_t fault_rsp;
+	uintptr_t stack_bottom;
+	
+	#ifdef USERPROG
 	/* Owned by userprog/process.c. */
 	uint64_t *pml4;                     /* Page map level 4 */
 #endif
 #ifdef VM
 	/* Table for whole virtual memory owned by thread. */
 	struct supplemental_page_table spt;
+	struct list mmaping_list;
 #endif
 
 	/* Owned by thread.c. */

@@ -21,6 +21,7 @@
 #include "threads/malloc.h"
 #include "intrinsic.h"
 #include "threads/synch.h"
+#include "lib/kernel/list.h"
 
 #ifdef VM
 #include "vm/vm.h"
@@ -42,7 +43,6 @@ struct fork_args {
 	struct semaphore sema;
 	bool success;
 };
-
 
 /* General process initializer for initd and other process. */
 static void
@@ -85,7 +85,6 @@ initd (void *f_name) {
 #ifdef VM
 	supplemental_page_table_init (&thread_current ()->spt);
 #endif
-
 	struct fd_info *stdin_info;
 	if ((stdin_info = make_fd_info(0, STDIN_FILE)) == NULL) {
 		PANIC("Fail to launch initd\n");
@@ -203,8 +202,10 @@ __do_fork (void *aux) {
 	/* 2. Duplicate PT */
 	current->pml4 = pml4_create();
 	if (current->pml4 == NULL)
-		goto error;
-
+	goto error;
+	
+	current->stack_bottom = parent->stack_bottom;
+	
 	process_activate (current);
 #ifdef VM
 	supplemental_page_table_init (&current->spt);
@@ -353,7 +354,6 @@ process_exec (void *f_name) {
 	NOT_REACHED ();
 }
 
-
 /* Waits for thread TID to die and returns its exit status.  If
  * it was terminated by the kernel (i.e. killed due to an
  * exception), returns -1.  If TID is invalid or if it was not a
@@ -464,6 +464,7 @@ process_exit (void) {
 	if(curr->my_info != NULL){
 		curr->my_info->return_status = curr->exit_status;
 		intr_set_level(old_level);
+		process_cleanup (); // cleanup 안에서 pml4를 확인하고 잇음 
 		sema_up(&(curr->my_info->wait));
 		old_level = intr_disable();
 		curr->my_info->reference--;
@@ -472,8 +473,6 @@ process_exit (void) {
 		}
 	}
 	intr_set_level(old_level);
-
-	process_cleanup (); // cleanup 안에서 pml4를 확인하고 잇음 
 }
 
 /* Free the current process's resources. */
@@ -482,6 +481,12 @@ process_cleanup (void) {
 	struct thread *curr = thread_current ();
 
 #ifdef VM
+	while (!list_empty(&thread_current()->mmaping_list)) {
+		struct list_elem *curr_mapping_elem = list_front(&thread_current()->mmaping_list);
+		struct mmaping_info *curr_mapping_info = list_entry(curr_mapping_elem, struct mmaping_info, mmaping_elem);
+		do_munmap(curr_mapping_info->start_addr);
+	}
+
 	supplemental_page_table_kill (&curr->spt);
 #endif
 
@@ -893,11 +898,64 @@ install_page (void *upage, void *kpage, bool writable) {
  * If you want to implement the function for only project 2, implement it on the
  * upper block. */
 
-static bool
+bool
 lazy_load_segment (struct page *page, void *aux) {
 	/* TODO: Load the segment from the file */
 	/* TODO: This called when the first page fault occurs on address VA. */
 	/* TODO: VA is available when calling this function. */
+
+	struct page_plan *page_plan = (struct page_plan *)aux;
+
+	off_t read_amount = file_read_at(page_plan->file, page->frame->kva, page_plan->read_bytes_plan, page_plan->ofs);
+
+	if (read_amount != page_plan->read_bytes_plan) {
+		free(page_plan);
+		return false;
+	}
+
+	void *page_zero_area = page->frame->kva + read_amount;
+	memset(page_zero_area, 0, page_plan->zero_bytes_plan);
+	
+	if (page->operations->type == VM_FILE) {
+		page->file.file = page_plan->file;
+		page->file.ofs = page_plan->ofs;
+		page->file.read_bytes_plan = page_plan->read_bytes_plan;
+		page->file.zero_bytes_plan = page_plan->zero_bytes_plan;
+		page->file.is_swapped = false;
+	}
+
+	free(page_plan);
+	
+	return true;
+}
+
+bool split_and_register_pages (struct file *file, off_t ofs, uint8_t *upage,
+		uint32_t read_bytes, uint32_t zero_bytes, bool writable,
+		enum vm_type type, vm_initializer *init) {
+	while (read_bytes > 0 || zero_bytes > 0) {
+		size_t page_read_bytes = read_bytes < PGSIZE ? read_bytes : PGSIZE;
+		size_t page_zero_bytes = PGSIZE - page_read_bytes;
+
+		/* TODO: lazy_load_segment에 정보를 넘겨줄 수 있도록 aux를 설정하세요. */
+		struct page_plan *aux = setup_aux (file, ofs, page_read_bytes, page_zero_bytes);
+		if (aux == NULL) {
+			return false;
+		}
+
+		if (!vm_alloc_page_with_initializer (type, upage,
+					writable, init, aux)) {
+			free(aux);
+			return false;
+		}
+
+		/* Advance. */
+		read_bytes -= page_read_bytes;
+		zero_bytes -= page_zero_bytes;
+		upage += PGSIZE;
+		ofs += page_read_bytes;
+	}
+
+	return true;
 }
 
 /* Loads a segment starting at offset OFS in FILE at address
@@ -921,25 +979,8 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
 	ASSERT (pg_ofs (upage) == 0);
 	ASSERT (ofs % PGSIZE == 0);
 
-	while (read_bytes > 0 || zero_bytes > 0) {
-		/* Do calculate how to fill this page.
-		 * We will read PAGE_READ_BYTES bytes from FILE
-		 * and zero the final PAGE_ZERO_BYTES bytes. */
-		size_t page_read_bytes = read_bytes < PGSIZE ? read_bytes : PGSIZE;
-		size_t page_zero_bytes = PGSIZE - page_read_bytes;
-
-		/* TODO: Set up aux to pass information to the lazy_load_segment. */
-		void *aux = NULL;
-		if (!vm_alloc_page_with_initializer (VM_ANON, upage,
-					writable, lazy_load_segment, aux))
-			return false;
-
-		/* Advance. */
-		read_bytes -= page_read_bytes;
-		zero_bytes -= page_zero_bytes;
-		upage += PGSIZE;
-	}
-	return true;
+	bool is_success =  split_and_register_pages(file, ofs, upage, read_bytes, zero_bytes, writable, VM_ANON, lazy_load_segment);
+	return is_success;
 }
 
 /* Create a PAGE of stack at the USER_STACK. Return true on success. */
@@ -952,6 +993,16 @@ setup_stack (struct intr_frame *if_) {
 	 * TODO: If success, set the rsp accordingly.
 	 * TODO: You should mark the page is stack. */
 	/* TODO: Your code goes here */
+	/* TODO: stack_bottom 위치에 스택을 매핑하고, 그 페이지를 즉시 claim하세요.
+	 * TODO: 성공하면 rsp를 그에 맞게 설정하세요.
+	 * TODO: 이 페이지가 스택이라는 표시를 해 두어야 합니다. */
+	/* TODO: 여기에 코드를 작성하세요. */
+
+	if (vm_alloc_page(VM_ANON | VM_MARKER_0, stack_bottom, true) && vm_claim_page(stack_bottom)) {
+		if_->rsp = USER_STACK;
+		thread_current()->stack_bottom = stack_bottom;
+		success = true;
+	}
 
 	return success;
 }

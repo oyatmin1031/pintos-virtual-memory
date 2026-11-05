@@ -1,8 +1,8 @@
 #ifndef VM_VM_H
 #define VM_VM_H
 #include <stdbool.h>
+#include <hash.h>
 #include "threads/palloc.h"
-#include "lib/kernel/hash.h"
 
 enum vm_type {
 	/* page not initialized */
@@ -49,6 +49,9 @@ struct page {
 	/* Your implementation */
 	struct hash_elem hash_elem;
 
+	bool can_write;
+	uint64_t *remember_pml4;
+
 	/* Per-type data are binded into the union.
 	 * Each function automatically detects the current union */
 	union {
@@ -61,10 +64,18 @@ struct page {
 	};
 };
 
+struct page_plan {
+	struct file *file;
+	off_t ofs;
+	size_t read_bytes_plan;
+	size_t zero_bytes_plan;
+};
+
 /* The representation of "frame" */
 struct frame {
 	void *kva;
 	struct page *page;
+	struct list_elem using_frame_elem;
 };
 
 /* The function table for page operations.
@@ -87,20 +98,31 @@ struct page_operations {
  * We don't want to force you to obey any specific design for this struct.
  * All designs up to you for this. */
 struct supplemental_page_table {
-	struct hash hash;
+	struct hash spt_hash;
+	// 페이지 정보
 };
+
+struct mmaping_info {
+	struct file *file;
+	int page_count;
+	void *start_addr;
+	struct list_elem mmaping_elem;
+};
+
 
 #include "threads/thread.h"
 void supplemental_page_table_init (struct supplemental_page_table *spt);
+struct page_plan *setup_aux (struct file *file, off_t ofs, size_t page_read_bytes, size_t page_zero_bytes);
 bool supplemental_page_table_copy (struct supplemental_page_table *dst,
 		struct supplemental_page_table *src);
 void supplemental_page_table_kill (struct supplemental_page_table *spt);
 struct page *spt_find_page (struct supplemental_page_table *spt,
 		void *va);
 bool spt_insert_page (struct supplemental_page_table *spt, struct page *page);
-void spt_remove_page (struct supplemental_page_table *spt, struct page *page);
+bool spt_remove_page (struct supplemental_page_table *spt, struct page *page);
 
 void vm_init (void);
+bool can_stack_grow (uint64_t rsp, uint64_t page_fault_point);
 bool vm_try_handle_fault (struct intr_frame *f, void *addr, bool user,
 		bool write, bool not_present);
 

@@ -673,6 +673,7 @@ init_thread (struct thread *t, const char *name, int priority) {
 	t->open = 2;
 
 	list_init(&t->child_list);
+	list_init(&t->mmaping_list);
 	t->my_info = NULL;
 
 	if(thread_mlfqs){

@@ -55,7 +55,9 @@ static void sys_write (struct intr_frame *f);
 static void sys_seek (struct intr_frame *f);
 static void sys_tell (struct intr_frame *f);
 static void sys_close (struct intr_frame *f);
-static void sys_dup2(struct intr_frame *f); 
+static void sys_dup2(struct intr_frame *f);
+static void sys_mmap(struct intr_frame *f); 
+static void sys_munmap(struct intr_frame *f); 
 
 void
 syscall_init (void) {
@@ -73,9 +75,11 @@ syscall_init (void) {
 
 /* The main system call interface */
 void
-syscall_handler (struct intr_frame *f UNUSED) {
+syscall_handler (struct intr_frame *f) {
 
 	uint64_t syscall_num = f->R.rax;
+	thread_current()->fault_rsp = f->rsp;
+
 	switch (syscall_num){
 		case SYS_HALT:
 			sys_halt(f);
@@ -121,6 +125,12 @@ syscall_handler (struct intr_frame *f UNUSED) {
 			break;
 		case SYS_DUP2:
 			sys_dup2(f);
+			break;
+		case SYS_MMAP:
+			sys_mmap(f);
+			break;
+		case SYS_MUNMAP:
+			sys_munmap(f);
 			break;
 		default:
 			printf ("system call!\n");
@@ -292,17 +302,20 @@ sys_filesize(struct intr_frame *f) {
 
 static void
 sys_read (struct intr_frame *f) {
-
-
 	int fd = f->R.rdi;
 	char *buffer = (char *)f->R.rsi;
 	unsigned size = f->R.rdx;
 
+	struct page *find_page = spt_find_page(&thread_current()->spt, buffer);
+	if (find_page != NULL && find_page->can_write == false) {
+		thread_exit();
+	}
+	
 	if(!is_valid_buffer(buffer, size, '\0')){
 		thread_current()->exit_status = -1;
 		thread_exit();
 	}
-
+	
 	struct fd_info *fd_info;
 
 	if ((fd_info = seek_fd_info(thread_current() , fd)) == NULL) {
@@ -319,8 +332,7 @@ sys_read (struct intr_frame *f) {
 		f->R.rax = 0;
 		return;
 	}
-
-
+	
 	if(fd_info->file_info->my_file == STDIN_FILE){
 		for(int i= 0; i < size; i++){
 			buffer[i] = input_getc();
@@ -375,7 +387,6 @@ sys_tell (struct intr_frame *f) {
 	
 }
 
-
 static void
 sys_write (struct intr_frame *f) {
 	void *  buffer = (void *)f->R.rsi;
@@ -387,7 +398,6 @@ sys_write (struct intr_frame *f) {
 		thread_exit(); // 접근하면 안 되는 포인터를 주면 프로세스 종료 
 		
 	}
-
 
 	struct fd_info *fd_info;
 
@@ -535,7 +545,7 @@ static bool is_invaild_filename(char * filename){
 
 static bool is_valid_buffer(char *buffer, int size, void *arg) {
 	struct thread *curr = thread_current();
-	if (buffer == arg || is_kernel_vaddr(buffer + size) || pml4_get_page(curr->pml4, buffer) == NULL) {
+	if (buffer == arg || is_kernel_vaddr(buffer + size) || (spt_find_page(&curr->spt, buffer) == NULL && !can_stack_grow(thread_current()->fault_rsp, (uint64_t)buffer))) {
 		return false;
 	}
 	return true;
@@ -552,4 +562,69 @@ static struct fd_info * seek_fd_info (struct thread *curr, int fd) {
 	}
 
 	return NULL;
+}
+
+static bool can_mapping (struct file *file, void *addr, size_t length, int fd, off_t offset) {
+	if (!is_user_vaddr(addr) || !is_user_vaddr(addr + length) || addr + length < addr) {
+		return false;
+	} 
+	
+	if (fd < 2) {
+		return false;
+	}
+
+	if (file_length(file) == 0 || length == 0 || offset % PGSIZE != 0) {
+		return false;
+	}
+
+	if (addr == NULL) {
+		return false;
+	}
+
+	if (pg_ofs (addr) != 0) {
+		return false;
+	}
+
+	int page_count = (length % PGSIZE == 0) ? length / PGSIZE : length / PGSIZE + 1;
+	for (int i = 0; i < page_count; i++) {
+		if (spt_find_page(&thread_current()->spt, addr + PGSIZE * i) != NULL) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
+static void sys_mmap(struct intr_frame *f) {
+	void *addr = (void *)f->R.rdi;
+	size_t length = f->R.rsi;
+	int writable = f->R.rdx;
+	int fd = f->R.r10;
+	off_t offset = f->R.r8;
+	
+	struct fd_info *file_info = seek_fd_info (thread_current(), fd);
+	if (file_info == NULL) {
+		f->R.rax = 0;
+		return;
+	}
+
+	struct file *file = file_info->file_info->my_file;
+	if (!can_mapping (file, addr, length, fd, offset)) {
+		f->R.rax = 0;
+		return;
+	}
+
+	void *va = do_mmap(addr, length, writable, file, offset);
+
+	if (va == NULL) {
+		f->R.rax = 0;
+		return;
+	}
+
+	f->R.rax = (uint64_t)va;
+}
+
+static void sys_munmap(struct intr_frame *f) {
+	void *addr = (void *)f->R.rdi;
+	do_munmap(addr);
 }
